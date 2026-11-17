@@ -53,7 +53,7 @@ def unwrap(payload: dict[str, Any]) -> Any:
 
 
 class SparClient:
-    def __init__(self, token: str | None = None, timeout: int = 30):
+    def __init__(self, token: str | None = None, timeout: int = 30, verbose: bool = False):
         self.http = requests.Session()
         self.http.headers.update({
             "Accept": "application/json",
@@ -65,17 +65,46 @@ class SparClient:
             "Content-Type": "application/json; charset=UTF8",
         })
         self.timeout = timeout
+        self.verbose = verbose
         self.token = token
         if token:
             self.http.headers["Authorization"] = f"Bearer {token}"
 
+    @staticmethod
+    def _safe_log(value: Any) -> Any:
+        secret_keys = {"token", "access_token", "refresh_token", "push_token", "otp", "hash", "authorization"}
+        if isinstance(value, dict):
+            return {
+                key: ("<скрыто>" if key.lower() in secret_keys else
+                      ("***" + str(item)[-3:] if key.lower() == "identifier" and item else
+                       SparClient._safe_log(item)))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [SparClient._safe_log(item) for item in value]
+        return value
+
     def post(self, path: str, body: dict[str, Any], auth: bool = True, appv2: bool = False) -> dict[str, Any]:
         headers = {} if auth else {"Authorization": ""}
         base = APPV2_URL if appv2 else BASE_URL
+        url = base + path
+        if self.verbose:
+            print(f"\n[API] POST {url}", file=sys.stderr)
+            print("[API] Запрос: " + json.dumps(self._safe_log(body), ensure_ascii=False, indent=2), file=sys.stderr)
         last_exc = None
         for attempt in range(5):
             try:
-                r = self.http.post(base + path, json=body, headers=headers, timeout=self.timeout)
+                started = time.monotonic()
+                r = self.http.post(url, json=body, headers=headers, timeout=self.timeout)
+                elapsed = time.monotonic() - started
+                if self.verbose:
+                    print(f"[API] HTTP {r.status_code} за {elapsed:.3f} с", file=sys.stderr)
+                if self.verbose:
+                    try:
+                        logged_response = self._safe_log(r.json())
+                        print("[API] Ответ: " + json.dumps(logged_response, ensure_ascii=False, indent=2), file=sys.stderr)
+                    except ValueError:
+                        print("[API] Ответ (не JSON): " + r.text[:4000], file=sys.stderr)
                 if r.status_code == 401:
                     raise RuntimeError("HTTP 401: токен не принят или истёк. Выполните login заново.")
                 if r.status_code == 429 or r.status_code >= 500:
@@ -196,13 +225,13 @@ def token_expiry_epoch(token_life: str | None, access_token: str | None = None) 
         return 0
 
 
-def login(config: Path, timeout: int) -> None:
+def login(config: Path, timeout: int, verbose: bool = False) -> None:
     session_file, device_file = ensure_config(config)
     phone = input("Телефон SPAR (например 79255510833): ").strip()
     if not phone:
         raise SystemExit("Телефон не указан")
     phone = "".join(ch for ch in phone if ch.isdigit())
-    api = SparClient(timeout=timeout)
+    api = SparClient(timeout=timeout, verbose=verbose)
     print("Запрашиваю SMS-код через appv2/otp/signup…")
     signup = api.request_sms(phone)
     otp_hash = signup.get("hash") if isinstance(signup, dict) else None
@@ -274,7 +303,7 @@ def save_purchase(db: sqlite3.Connection, item: dict[str, Any]) -> None:
                 json.dumps(p, ensure_ascii=False)))
 
 
-def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: bool) -> None:
+def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: bool, verbose: bool = False) -> None:
     session_file, _ = ensure_config(config)
     session = load_session(session_file)
     # Recalculate for sessions created by older script versions (which treated
@@ -292,7 +321,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
         if not refresh:
             raise RuntimeError("Срок действия access token подходит к концу, refresh_token отсутствует. Выполните login.")
         print("Access token скоро истечёт; обновляю через spar-auth/token/refresh…")
-        refresh_api = SparClient(timeout=timeout)
+        refresh_api = SparClient(timeout=timeout, verbose=verbose)
         info = refresh_api.refresh_access_token(refresh)
 
         # AuthTokenResponse -> BasicResponse.data -> tokenInfo.
@@ -311,7 +340,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
         else:
             remaining = max(0, int(session["expires_at"] - time.time()))
             print(f"Токен обновлён; срок действия примерно {remaining // 60} мин.")
-    api = SparClient(session["access_token"], timeout)
+    api = SparClient(session["access_token"], timeout, verbose=verbose)
     db = open_db(db_path)
     ids: set[str] = set()
     pages = 0
@@ -383,11 +412,13 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--max-pages", type=int, default=0, help="0 — все страницы")
     p.add_argument("--no-details", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="подробный журнал API-запросов и ответов (секреты скрываются)")
     args = p.parse_args()
     if args.command in ("login", "all"):
-        login(args.config.expanduser(), args.timeout)
+        login(args.config.expanduser(), args.timeout, args.verbose)
     if args.command in ("sync", "all"):
-        sync(args.config.expanduser(), args.db.expanduser(), args.timeout, args.max_pages, args.no_details)
+        sync(args.config.expanduser(), args.db.expanduser(), args.timeout, args.max_pages, args.no_details, args.verbose)
 
 
 if __name__ == "__main__":
