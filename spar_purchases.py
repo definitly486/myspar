@@ -18,6 +18,8 @@ from typing import Any
 
 import requests
 
+from spar_history import load_history, payment_details, show as show_history
+
 BASE_URL = "https://myspar.ru/api/"
 APPV2_URL = "https://myspar.ru/api/appv2/"
 AUTH_SIGNUP = "spar-auth/otp/signup"
@@ -303,7 +305,7 @@ def save_purchase(db: sqlite3.Connection, item: dict[str, Any]) -> None:
                 json.dumps(p, ensure_ascii=False)))
 
 
-def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: bool, verbose: bool = False) -> None:
+def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: bool, verbose: bool = False, json_output: bool = False) -> None:
     session_file, _ = ensure_config(config)
     session = load_session(session_file)
     # Recalculate for sessions created by older script versions (which treated
@@ -320,7 +322,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
         refresh = session.get("refresh_token")
         if not refresh:
             raise RuntimeError("Срок действия access token подходит к концу, refresh_token отсутствует. Выполните login.")
-        print("Access token скоро истечёт; обновляю через spar-auth/token/refresh…")
+        print("Access token скоро истечёт; обновляю через spar-auth/token/refresh…", file=sys.stderr if json_output else sys.stdout)
         refresh_api = SparClient(timeout=timeout, verbose=verbose)
         info = refresh_api.refresh_access_token(refresh)
 
@@ -339,7 +341,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
             print("Предупреждение: не удалось определить срок действия нового токена; при следующем запуске проверка будет повторена.", file=sys.stderr)
         else:
             remaining = max(0, int(session["expires_at"] - time.time()))
-            print(f"Токен обновлён; срок действия примерно {remaining // 60} мин.")
+            print(f"Токен обновлён; срок действия примерно {remaining // 60} мин.", file=sys.stderr if json_output else sys.stdout)
     api = SparClient(session["access_token"], timeout, verbose=verbose)
     db = open_db(db_path)
     ids: set[str] = set()
@@ -375,7 +377,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
             db.commit()
             pages += 1
             seen += len(items)
-            print(f"Страница {page}: {len(items)} покупок" + (f" / {total_pages}" if total_pages else ""))
+            print(f"Страница {page}: {len(items)} покупок" + (f" / {total_pages}" if total_pages else ""), file=sys.stderr if json_output else sys.stdout)
             if not items or (total_pages is not None and page >= total_pages) or (max_pages and pages >= max_pages):
                 break
             page += 1
@@ -387,8 +389,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
                     save_purchase(db, detail)
                     db.commit()
                     details += 1
-                print(f"Подробности: {n}/{len(ids)}")
-        print("\nСинхронизация завершена")
+                print(f"Подробности: {n}/{len(ids)}", file=sys.stderr if json_output else sys.stdout)
         api_total = None
         if isinstance(paging, dict) and paging.get("items_all") is not None:
             try:
@@ -396,10 +397,51 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
             except (TypeError, ValueError):
                 pass
         total_note = f"; всего по API: {api_total}" if api_total is not None else ""
-        print(f"Страниц: {pages}; покупок в ответах списка: {seen}{total_note}; подробностей: {details}")
-        print(f"В SQLite покупок: {db.execute('SELECT COUNT(*) FROM purchases').fetchone()[0]}")
-        print(f"Товарных строк: {db.execute('SELECT COUNT(*) FROM purchase_products').fetchone()[0]}")
-        print(f"База данных: {db_path}")
+        purchases, products = load_history(db_path)
+        if json_output:
+            output = []
+            for purchase in purchases:
+                pid = str(purchase.get("id") or "")
+                try:
+                    purchase_raw = json.loads(purchase.get("raw_json") or "{}")
+                except (TypeError, ValueError):
+                    purchase_raw = {}
+                purchase_data = {k: v for k, v in purchase.items() if k != "raw_json"}
+                purchase_data["raw"] = purchase_raw
+                purchase_data["payment"] = payment_details(purchase_raw)
+                product_rows = []
+                for product in products.get(pid, []):
+                    product_data = {k: v for k, v in product.items() if k != "raw_json"}
+                    try:
+                        product_data["raw"] = json.loads(product.get("raw_json") or "{}")
+                    except (TypeError, ValueError):
+                        product_data["raw"] = {}
+                    product_rows.append(product_data)
+                if not product_rows:
+                    embedded = purchase_raw.get("basket") or purchase_raw.get("products")
+                    if isinstance(embedded, list):
+                        product_rows = embedded
+                purchase_data["products"] = product_rows
+                output.append(purchase_data)
+            result = {
+                "database": str(db_path),
+                "sync": {
+                    "pages": pages,
+                    "purchases_in_list_responses": seen,
+                    "api_total": api_total,
+                    "details": details,
+                },
+                "purchase_count": len(purchases),
+                "purchases": output,
+            }
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        else:
+            print("\nСинхронизация завершена")
+            print(f"Страниц: {pages}; покупок в ответах списка: {seen}{total_note}; подробностей: {details}")
+            print(f"В SQLite покупок: {db.execute('SELECT COUNT(*) FROM purchases').fetchone()[0]}")
+            print(f"Товарных строк: {db.execute('SELECT COUNT(*) FROM purchase_products').fetchone()[0]}")
+            print(f"База данных: {db_path}")
+            show_history(purchases, products, 0)
     finally:
         db.close()
 
@@ -412,13 +454,14 @@ def main() -> None:
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--max-pages", type=int, default=0, help="0 — все страницы")
     p.add_argument("--no-details", action="store_true")
+    p.add_argument("--json", action="store_true", help="вывести результат синхронизации в JSON (без текстового вывода)")
     p.add_argument("-v", "--verbose", action="store_true",
                    help="подробный журнал API-запросов и ответов (секреты скрываются)")
     args = p.parse_args()
     if args.command in ("login", "all"):
         login(args.config.expanduser(), args.timeout, args.verbose)
     if args.command in ("sync", "all"):
-        sync(args.config.expanduser(), args.db.expanduser(), args.timeout, args.max_pages, args.no_details, args.verbose)
+        sync(args.config.expanduser(), args.db.expanduser(), args.timeout, args.max_pages, args.no_details, args.verbose, args.json)
 
 
 if __name__ == "__main__":
