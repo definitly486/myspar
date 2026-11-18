@@ -55,6 +55,46 @@ def value_from(raw: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def payment_details(raw: dict[str, Any]) -> dict[str, Any]:
+    """Извлекает сведения об оплате из разных вариантов структуры ответа SPAR."""
+    method_keys = {"paymentmethod", "paymenttype", "methodname", "paymenttypename",
+                   "paymentmethodname", "paytype", "paytypename"}
+    card_keys = {"card", "cardinfo", "bankcard", "paymentcard", "carddetails"}
+    masked_keys = {"maskedpan", "maskedcard", "maskednumber", "cardmask",
+                   "cardnumbermasked", "panmasked", "maskedcardnumber"}
+    last4_keys = {"last4", "lastfour", "cardlast4", "cardnumberlast4"}
+    bank_keys = {"bankname", "issuername", "paymentprovider", "providername"}
+    result: dict[str, Any] = {}
+    seen: set[int] = set()
+
+    def walk(value: Any):
+        if isinstance(value, dict) and id(value) not in seen:
+            seen.add(id(value))
+            for key, item in value.items():
+                normalized = "".join(ch for ch in str(key).lower() if ch.isalnum())
+                if normalized in method_keys and isinstance(item, (str, int, float)):
+                    result.setdefault("method", str(item))
+                elif normalized in masked_keys and isinstance(item, (str, int, float)):
+                    result.setdefault("card", str(item))
+                elif normalized in last4_keys and isinstance(item, (str, int, float)):
+                    digits = "".join(ch for ch in str(item) if ch.isdigit())
+                    if digits:
+                        result.setdefault("card_last4", digits[-4:])
+                elif normalized in bank_keys and isinstance(item, (str, int, float)):
+                    result.setdefault("bank", str(item))
+                elif normalized in card_keys and isinstance(item, dict):
+                    # Обходим объект карты, не выводя токены и полные реквизиты.
+                    walk(item)
+                elif isinstance(item, (dict, list)):
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(raw)
+    return result
+
+
 def load_history(db_path: Path):
     if not db_path.is_file():
         raise RuntimeError(f"База не найдена: {db_path}")
@@ -102,6 +142,19 @@ def show(purchases, products, limit: int):
         print(f"{index}. Покупка от {date}")
         print(f"   Номер: {pid or '—'}")
         print(f"   Сумма: {money(total)}")
+        payment = payment_details(raw)
+        if payment:
+            parts = []
+            if payment.get("method"):
+                parts.append(payment["method"])
+            if payment.get("card"):
+                parts.append(f"карта {payment['card']}")
+            elif payment.get("card_last4"):
+                parts.append(f"карта ****{payment['card_last4']}")
+            if payment.get("bank"):
+                parts.append(payment["bank"])
+            if parts:
+                print("   Оплата: " + ", ".join(parts))
         if status is not None:
             print(f"   Статус: {status}")
         if address:
