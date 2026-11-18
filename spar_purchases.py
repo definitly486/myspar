@@ -18,7 +18,7 @@ from typing import Any
 
 import requests
 
-from spar_history import load_history, show as show_history
+from spar_history import load_history, payment_details, show as show_history
 
 BASE_URL = "https://myspar.ru/api/"
 APPV2_URL = "https://myspar.ru/api/appv2/"
@@ -408,6 +408,7 @@ def sync(config: Path, db_path: Path, timeout: int, max_pages: int, no_details: 
                     purchase_raw = {}
                 purchase_data = {k: v for k, v in purchase.items() if k != "raw_json"}
                 purchase_data["raw"] = purchase_raw
+                purchase_data["payment"] = payment_details(purchase_raw)
                 product_rows = []
                 for product in products.get(pid, []):
                     product_data = {k: v for k, v in product.items() if k != "raw_json"}
